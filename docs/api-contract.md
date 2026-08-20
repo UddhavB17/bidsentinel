@@ -1,7 +1,8 @@
 # BidSentinel API contract
 
-Status: proposed handoff. This document defines response contracts only; no API
-server is implemented by this task.
+Status: implemented MVP. `services/collector-worker/src/server.ts` serves these
+typed read endpoints from in-memory stores. It also exposes runtime/healing
+status plus guarded demo/operator mutations described below.
 
 ## Conventions
 
@@ -58,6 +59,25 @@ That tradeoff is accepted for the MVP; a cursor contract should replace it
 before these collections become large or heavily updated.
 
 ## Endpoints
+
+Additional implemented endpoints:
+
+- `GET /api/runtime` reports explicit `mock` or `live` mode and configuration
+  readiness without returning credentials.
+- `GET /api/healing/{sourceId}` reports the healing state, preview count, and
+  redacted recovery evidence.
+- `POST /api/dev/collect?mode=valid|drift|amended|live` runs one demo or live
+  collection cycle.
+- `POST /api/dev/heal-progress` polls the active same-collector repair.
+- `POST /api/dev/validate-preview` runs the returned preview through the frozen
+  schema/count gate.
+- `POST /api/dev/approve` accepts `{ "approve": true|false }`; approval is a
+  `409` unless the preview is valid.
+
+When the runtime is live, every mutation above is denied unless live mutations
+are explicitly enabled and `X-BidSentinel-Operator-Token` matches the private
+operator token. These are hackathon control surfaces and should remain local or
+behind proper production authentication.
 
 ### `GET /health`
 

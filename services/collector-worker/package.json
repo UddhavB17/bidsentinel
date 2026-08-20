@@ -8,9 +8,9 @@
   },
   "scripts": {
     "build": "tsup src/index.ts src/cli.ts src/server.ts --format esm --dts --clean",
-    "demo": "node --import tsx src/cli.ts",
-    "collect": "node --import tsx src/collect-cycle.ts",
-    "start": "node --import tsx src/server.ts",
+    "demo": "node --env-file-if-exists=../../.env --import tsx src/cli.ts",
+    "collect": "node --env-file-if-exists=../../.env --import tsx src/collect-cycle.ts",
+    "start": "node --env-file-if-exists=../../.env --import tsx src/server.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json"
   },
@@ -21,4 +21,3 @@
     "zod": "catalog:"
   }
 }
-

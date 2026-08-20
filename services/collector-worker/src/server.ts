@@ -1,4 +1,8 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { randomUUID } from "node:crypto";
 import type { ZodTypeAny } from "zod";
 import {
@@ -9,22 +13,22 @@ import {
   SourceHealthListResponseSchema,
   QuarantineListResponseSchema,
 } from "@bidsentinel/contracts";
-import { validTenderFixture, tenderWithCorrigendumFixture } from "@bidsentinel/contracts/fixtures";
-import { MockBrightDataHealingProvider } from "@bidsentinel/brightdata";
-import { BidSentinelPipeline } from "./pipeline.js";
-import { SelfHealingCoordinator } from "./healing-coordinator.js";
+import {
+  validTenderFixture,
+  tenderWithCorrigendumFixture,
+} from "@bidsentinel/contracts/fixtures";
+import { hashPayload } from "@bidsentinel/validation";
+import type { BidSentinelPipeline } from "./pipeline.js";
+import type { SelfHealingCoordinator } from "./healing-coordinator.js";
+import {
+  createRuntimeFromEnv,
+  isAuthorizedOperatorToken,
+  runConfiguredCollection,
+  type BidSentinelRuntime,
+} from "./runtime.js";
 
-const pipeline = new BidSentinelPipeline();
-const healingProvider = new MockBrightDataHealingProvider();
-const coordinator = new SelfHealingCoordinator(healingProvider);
-pipeline.healingCoordinator = coordinator;
-
-// Seed initial healthy tender
-pipeline.process(validTenderFixture, {
-  sourceId: "gem",
-  extractorVersion: "initial-seeder",
-  observedAt: "2026-08-20T05:00:00.000Z",
-});
+const runtime = createRuntimeFromEnv();
+const { pipeline, coordinator } = runtime;
 
 // Custom HTTP Errors
 class HttpError extends Error {
@@ -32,7 +36,7 @@ class HttpError extends Error {
     public readonly code: string,
     public readonly status: number,
     message: string,
-    public readonly details: unknown[] = []
+    public readonly details: unknown[] = [],
   ) {
     super(message);
     this.name = "HttpError";
@@ -57,10 +61,37 @@ class MethodNotAllowedError extends HttpError {
   }
 }
 
+class ConflictError extends HttpError {
+  constructor(message: string) {
+    super("conflict", 409, message);
+  }
+}
+
+class ForbiddenError extends HttpError {
+  constructor(message: string) {
+    super("forbidden", 403, message);
+  }
+}
+
 export function createRequestHandler(
   pipelineInstance: BidSentinelPipeline,
-  coordinatorInstance: SelfHealingCoordinator
+  coordinatorInstance: SelfHealingCoordinator,
+  runtimeInstance?: BidSentinelRuntime,
 ) {
+  const activeRuntime: BidSentinelRuntime = runtimeInstance ?? {
+    mode: "mock",
+    pipeline: pipelineInstance,
+    coordinator: coordinatorInstance,
+    collectionProvider: null,
+    sourceId: "gem",
+    collectorId: null,
+    targetUrl: null,
+    configurationIssues: [
+      "Live runtime was not supplied to the request handler",
+    ],
+    liveMutationsEnabled: false,
+    operatorTokenHash: null,
+  };
   return async (req: IncomingMessage, res: ServerResponse) => {
     const generatedAt = new Date().toISOString();
     const requestId = `req-${randomUUID().replace(/-/g, "").substring(0, 15)}`;
@@ -77,7 +108,10 @@ export function createRequestHandler(
     if (origin && allowedOrigins.includes(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-BidSentinel-Operator-Token",
+      );
     } else if (!origin) {
       // Default fallback for client requests lacking origin header in local development
       res.setHeader("Access-Control-Allow-Origin", "*");
@@ -90,7 +124,9 @@ export function createRequestHandler(
     }
 
     const sendJson = (status: number, body: unknown) => {
-      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+      res.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+      });
       res.end(JSON.stringify(body, null, 2));
     };
 
@@ -108,12 +144,29 @@ export function createRequestHandler(
     };
 
     try {
-      const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+      const url = new URL(
+        req.url ?? "/",
+        `http://${req.headers.host || "localhost"}`,
+      );
       const path = url.pathname;
+      const requireLiveMutationAuthorization = () => {
+        if (activeRuntime.mode !== "live") return;
+        if (!activeRuntime.liveMutationsEnabled) {
+          throw new ForbiddenError("Live mutations are disabled");
+        }
+        const headerValue = req.headers["x-bidsentinel-operator-token"];
+        const suppliedToken = Array.isArray(headerValue)
+          ? undefined
+          : headerValue;
+        if (!isAuthorizedOperatorToken(activeRuntime, suppliedToken)) {
+          throw new ForbiddenError("Valid operator authorization is required");
+        }
+      };
 
       // 1. GET /health
       if (path === "/health") {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
         const body = ApiHealthResponseSchema.parse({
           data: {
             schemaVersion: 1,
@@ -126,9 +179,65 @@ export function createRequestHandler(
         return;
       }
 
+      if (path === "/api/runtime") {
+        if (req.method !== "GET") {
+          throw new MethodNotAllowedError("Method not allowed");
+        }
+        sendJson(200, {
+          data: {
+            mode: activeRuntime.mode,
+            sourceId: activeRuntime.sourceId,
+            collectorConfigured: activeRuntime.collectorId !== null,
+            targetConfigured: activeRuntime.targetUrl !== null,
+            liveMutationsEnabled: activeRuntime.liveMutationsEnabled,
+            configurationIssues: activeRuntime.configurationIssues,
+          },
+          generatedAt,
+        });
+        return;
+      }
+
+      if (path.startsWith("/api/healing/")) {
+        if (req.method !== "GET") {
+          throw new MethodNotAllowedError("Method not allowed");
+        }
+        const sourceId = decodeURIComponent(
+          path.substring("/api/healing/".length),
+        );
+        const incident = coordinatorInstance.getIncident(sourceId);
+        sendJson(200, {
+          data: {
+            mode: activeRuntime.mode,
+            sourceId,
+            state: coordinatorInstance.getHealingState(sourceId),
+            incident:
+              incident === undefined
+                ? null
+                : {
+                    incidentId: incident.incidentId,
+                    collectorId: incident.collectorId,
+                    state: incident.state,
+                    openedAt: incident.openedAt,
+                    updatedAt: incident.updatedAt,
+                    reason: incident.reason,
+                    prompt: incident.prompt ?? null,
+                    previewCount: incident.previewPayloads?.length ?? 0,
+                    previewValidated:
+                      incident.state === "preview_valid" ||
+                      incident.state === "approved" ||
+                      incident.state === "recovered",
+                    evidence: incident.evidence ?? null,
+                  },
+          },
+          generatedAt,
+        });
+        return;
+      }
+
       // 2. GET /api/tenders
       if (path === "/api/tenders") {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
 
         const tenderIds = pipelineInstance.snapshots.listUniqueTenderIds();
         const tenders = tenderIds.map((tid: string) => {
@@ -158,21 +267,32 @@ export function createRequestHandler(
         });
 
         // Sort: observedAt desc, then tenderId asc
-        tenders.sort((a: { observedAt: string; tenderId: string }, b: { observedAt: string; tenderId: string }) => {
-          const timeA = Date.parse(a.observedAt);
-          const timeB = Date.parse(b.observedAt);
-          if (timeA !== timeB) return timeB - timeA;
-          return a.tenderId.localeCompare(b.tenderId);
-        });
+        tenders.sort(
+          (
+            a: { observedAt: string; tenderId: string },
+            b: { observedAt: string; tenderId: string },
+          ) => {
+            const timeA = Date.parse(a.observedAt);
+            const timeB = Date.parse(b.observedAt);
+            if (timeA !== timeB) return timeB - timeA;
+            return a.tenderId.localeCompare(b.tenderId);
+          },
+        );
 
-        const paginated = paginate(tenders, url, TenderListResponseSchema, generatedAt);
+        const paginated = paginate(
+          tenders,
+          url,
+          TenderListResponseSchema,
+          generatedAt,
+        );
         sendJson(200, paginated);
         return;
       }
 
       // 3. GET /api/tenders/{tenderId}
       if (path.startsWith("/api/tenders/")) {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
         const encodedTenderId = path.substring("/api/tenders/".length);
         const tenderId = decodeURIComponent(encodedTenderId);
 
@@ -199,7 +319,8 @@ export function createRequestHandler(
 
       // 4. GET /api/changes
       if (path === "/api/changes") {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
         const changes = pipelineInstance.changeEvents.list();
 
         // Sort: detectedAt desc, then changeEventId asc
@@ -210,14 +331,20 @@ export function createRequestHandler(
           return a.changeEventId.localeCompare(b.changeEventId);
         });
 
-        const paginated = paginate(changes, url, ChangeEventListResponseSchema, generatedAt);
+        const paginated = paginate(
+          changes,
+          url,
+          ChangeEventListResponseSchema,
+          generatedAt,
+        );
         sendJson(200, paginated);
         return;
       }
 
       // 5. GET /api/sources
       if (path === "/api/sources") {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
 
         const sourceIds = pipelineInstance.sourceHealth.listSourceIds();
         const sources = sourceIds.map((sid: string) => {
@@ -226,17 +353,27 @@ export function createRequestHandler(
 
           const healingState = coordinatorInstance.getHealingState(sid);
           let state = rawHealth.state;
-          const recoveringStates = ["healing_requested", "awaiting_approval", "preview_valid", "preview_invalid", "approved", "rejected"];
+          const recoveringStates = [
+            "healing_requested",
+            "awaiting_approval",
+            "preview_valid",
+            "preview_invalid",
+            "approved",
+          ];
           if (recoveringStates.includes(healingState)) {
             state = "recovering";
           } else if (healingState === "recovered") {
             state = "healthy";
-          } else if (healingState === "recovery_failed") {
+          } else if (
+            healingState === "recovery_failed" ||
+            healingState === "rejected"
+          ) {
             state = "quarantined";
           }
 
           const incident = coordinatorInstance.getIncident(sid);
-          const latestRecoveryEvidence = incident?.evidence ?? rawHealth.latestRecoveryEvidence;
+          const latestRecoveryEvidence =
+            incident?.evidence ?? rawHealth.latestRecoveryEvidence;
 
           return {
             ...rawHealth,
@@ -246,97 +383,257 @@ export function createRequestHandler(
         });
 
         // Sort: sourceId asc
-        sources.sort((a: { sourceId: string }, b: { sourceId: string }) => a.sourceId.localeCompare(b.sourceId));
+        sources.sort((a: { sourceId: string }, b: { sourceId: string }) =>
+          a.sourceId.localeCompare(b.sourceId),
+        );
 
-        const paginated = paginate(sources, url, SourceHealthListResponseSchema, generatedAt);
+        const paginated = paginate(
+          sources,
+          url,
+          SourceHealthListResponseSchema,
+          generatedAt,
+        );
         sendJson(200, paginated);
         return;
       }
 
       // 6. GET /api/quarantines
       if (path === "/api/quarantines") {
-        if (req.method !== "GET") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "GET")
+          throw new MethodNotAllowedError("Method not allowed");
         const quarantines = pipelineInstance.quarantines.list();
 
         // Sort: observedAt desc, then quarantineId asc
-        quarantines.sort((a: { observedAt: string; quarantineId: string }, b: { observedAt: string; quarantineId: string }) => {
-          const timeA = Date.parse(a.observedAt);
-          const timeB = Date.parse(b.observedAt);
-          if (timeA !== timeB) return timeB - timeA;
-          return a.quarantineId.localeCompare(b.quarantineId);
-        });
+        quarantines.sort(
+          (
+            a: { observedAt: string; quarantineId: string },
+            b: { observedAt: string; quarantineId: string },
+          ) => {
+            const timeA = Date.parse(a.observedAt);
+            const timeB = Date.parse(b.observedAt);
+            if (timeA !== timeB) return timeB - timeA;
+            return a.quarantineId.localeCompare(b.quarantineId);
+          },
+        );
 
-        const paginated = paginate(quarantines, url, QuarantineListResponseSchema, generatedAt);
+        const paginated = paginate(
+          quarantines,
+          url,
+          QuarantineListResponseSchema,
+          generatedAt,
+        );
         sendJson(200, paginated);
         return;
       }
 
       // 7. POST /api/dev/collect
       if (path === "/api/dev/collect") {
-        if (req.method !== "POST") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "POST")
+          throw new MethodNotAllowedError("Method not allowed");
 
         const mode = url.searchParams.get("mode") ?? "valid";
+        if (mode === "live") {
+          requireLiveMutationAuthorization();
+          if (activeRuntime.mode !== "live") {
+            throw new ConflictError(
+              "Live collection requested while the server is explicitly in mock mode",
+            );
+          }
+          const summary = await runConfiguredCollection(activeRuntime);
+          sendJson(200, {
+            success: summary.success,
+            mode: "live",
+            outcomes: summary.outcomes,
+            collectorId: summary.collectorId,
+          });
+          return;
+        }
+        if (activeRuntime.mode === "live") {
+          throw new ConflictError(
+            "Fixture collection modes are disabled while the server is in live mode",
+          );
+        }
+
+        const sourceId = activeRuntime.sourceId;
         let payload: unknown;
         if (mode === "valid") {
-          payload = validTenderFixture;
+          payload = { ...validTenderFixture, sourceId };
         } else if (mode === "drift") {
           payload = {
-            tenderId: "gem:2026-rail-signalling-001",
+            tenderId: `${sourceId}:2026-rail-signalling-001`,
             externalId: "2026-rail-signalling-001",
             url: "https://example.gov.test/tenders/001",
             observedAt: new Date().toISOString(),
           };
         } else if (mode === "amended") {
-          payload = tenderWithCorrigendumFixture;
+          payload = { ...tenderWithCorrigendumFixture, sourceId };
         } else {
           throw new BadRequestError(`Unsupported collect mode: ${mode}`);
         }
 
         const context = {
-          sourceId: "gem",
+          sourceId,
+          collectorId: "c_mock_dev",
           extractorVersion: "dev-collector",
           observedAt: new Date().toISOString(),
         };
 
-        const result = pipelineInstance.process(payload, context);
+        const result = await pipelineInstance.processWithHealing(
+          payload,
+          context,
+        );
         sendJson(200, { success: true, mode, outcome: result.outcome });
         return;
       }
 
       // 8. POST /api/dev/heal-progress
       if (path === "/api/dev/heal-progress") {
-        if (req.method !== "POST") throw new MethodNotAllowedError("Method not allowed");
-        const status = await coordinatorInstance.pollProgress("gem", new Date().toISOString());
-        sendJson(200, { success: true, status, healingState: coordinatorInstance.getHealingState("gem") });
+        if (req.method !== "POST")
+          throw new MethodNotAllowedError("Method not allowed");
+        requireLiveMutationAuthorization();
+        const state = coordinatorInstance.getHealingState(
+          activeRuntime.sourceId,
+        );
+        if (state !== "healing_requested" && state !== "approved") {
+          throw new ConflictError(
+            `Cannot poll self-healing progress from state ${state}`,
+          );
+        }
+        const progress = await coordinatorInstance.pollProgress(
+          activeRuntime.sourceId,
+          new Date().toISOString(),
+        );
+        sendJson(200, {
+          success: true,
+          status: progress.status,
+          previewCount: progress.previewResult.length,
+          healingState: coordinatorInstance.getHealingState(
+            activeRuntime.sourceId,
+          ),
+        });
+        return;
+      }
+
+      if (path === "/api/dev/validate-preview") {
+        if (req.method !== "POST") {
+          throw new MethodNotAllowedError("Method not allowed");
+        }
+        requireLiveMutationAuthorization();
+        const state = coordinatorInstance.getHealingState(
+          activeRuntime.sourceId,
+        );
+        if (state !== "awaiting_approval" && state !== "preview_invalid") {
+          throw new ConflictError(
+            `Cannot validate a healing preview from state ${state}`,
+          );
+        }
+        const incident = coordinatorInstance.getIncident(
+          activeRuntime.sourceId,
+        );
+        if (!incident) {
+          throw new ConflictError(
+            "No self-healing incident has a preview to validate",
+          );
+        }
+        const valid = coordinatorInstance.handlePreview(
+          activeRuntime.sourceId,
+          incident.previewPayloads ?? [],
+          1,
+          new Date().toISOString(),
+        );
+        sendJson(200, {
+          success: valid,
+          previewCount: incident.previewPayloads?.length ?? 0,
+          healingState: coordinatorInstance.getHealingState(
+            activeRuntime.sourceId,
+          ),
+        });
         return;
       }
 
       // 9. POST /api/dev/approve
       if (path === "/api/dev/approve") {
-        if (req.method !== "POST") throw new MethodNotAllowedError("Method not allowed");
+        if (req.method !== "POST")
+          throw new MethodNotAllowedError("Method not allowed");
+        requireLiveMutationAuthorization();
 
         const bodyText = await readBodyText(req);
-        let approve = true;
+        let body: unknown;
         try {
-          const body = JSON.parse(bodyText) as Record<string, unknown>;
-          if (body && typeof body === "object" && "approve" in body) {
-            approve = !!body.approve;
-          }
+          body = JSON.parse(bodyText);
         } catch {
-          // Default to true
+          throw new BadRequestError("Request body must be valid JSON");
+        }
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          !("approve" in body) ||
+          typeof (body as { approve?: unknown }).approve !== "boolean"
+        ) {
+          throw new BadRequestError(
+            "Request body must include boolean approve",
+          );
+        }
+        const approve = (body as { approve: boolean }).approve;
+        const state = coordinatorInstance.getHealingState(
+          activeRuntime.sourceId,
+        );
+        if (approve && state !== "preview_valid") {
+          throw new ConflictError(
+            `Cannot approve self-healing from state ${state}; a schema-valid preview is required`,
+          );
+        }
+        if (
+          !approve &&
+          !["awaiting_approval", "preview_valid", "preview_invalid"].includes(
+            state,
+          )
+        ) {
+          throw new ConflictError(
+            `Cannot reject self-healing from state ${state}`,
+          );
         }
 
         const rerunFn = async () => {
-          pipelineInstance.process(validTenderFixture, {
-            sourceId: "gem",
-            extractorVersion: "dev-collector",
-            observedAt: new Date().toISOString(),
-          });
-          return true;
+          if (activeRuntime.mode === "live") {
+            return runConfiguredCollection(activeRuntime, {
+              enableHealing: false,
+            });
+          }
+          const result = pipelineInstance.process(
+            { ...validTenderFixture, sourceId: activeRuntime.sourceId },
+            {
+              sourceId: activeRuntime.sourceId,
+              collectorId: "c_mock_dev",
+              extractorVersion: "dev-collector",
+              observedAt: new Date().toISOString(),
+            },
+          );
+          return {
+            success: result.outcome === "accepted",
+            validTenderCount: result.outcome === "accepted" ? 1 : 0,
+            quarantinedCount: result.outcome === "quarantined" ? 1 : 0,
+            sampleTenderIds:
+              result.outcome === "accepted" ? [result.tender.tenderId] : [],
+            payloadHashes:
+              result.outcome === "accepted" ? [hashPayload(result.tender)] : [],
+          };
         };
 
-        await coordinatorInstance.approveOrReject("gem", approve, rerunFn, new Date().toISOString());
-        sendJson(200, { success: true, healingState: coordinatorInstance.getHealingState("gem") });
+        await coordinatorInstance.approveOrReject(
+          activeRuntime.sourceId,
+          approve,
+          rerunFn,
+          new Date().toISOString(),
+        );
+        sendJson(200, {
+          success:
+            coordinatorInstance.getHealingState(activeRuntime.sourceId) ===
+            "recovered",
+          healingState: coordinatorInstance.getHealingState(
+            activeRuntime.sourceId,
+          ),
+        });
         return;
       }
 
@@ -361,7 +658,12 @@ export function createRequestHandler(
   };
 }
 
-function paginate(items: unknown[], url: URL, responseSchema: ZodTypeAny, generatedAt: string): unknown {
+function paginate(
+  items: unknown[],
+  url: URL,
+  responseSchema: ZodTypeAny,
+  generatedAt: string,
+): unknown {
   const limitParam = url.searchParams.get("limit") ?? "50";
   const offsetParam = url.searchParams.get("offset") ?? "0";
 
@@ -414,9 +716,13 @@ async function readBodyText(req: IncomingMessage): Promise<string> {
 if (process.env.NODE_ENV !== "test") {
   const parsedPort = Number.parseInt(process.env.PORT ?? "4321", 10);
   const port = Number.isFinite(parsedPort) ? parsedPort : 4321;
-  const server = createServer(createRequestHandler(pipeline, coordinator));
+  const server = createServer(
+    createRequestHandler(pipeline, coordinator, runtime),
+  );
 
   server.listen(port, "127.0.0.1", () => {
-    console.warn(`BidSentinel backend API listening on http://127.0.0.1:${port}`);
+    console.warn(
+      `BidSentinel backend API listening on http://127.0.0.1:${port} (${runtime.mode} mode)`,
+    );
   });
 }
