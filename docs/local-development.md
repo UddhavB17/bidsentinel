@@ -29,23 +29,35 @@ The demo processes a valid tender, an invalid deadline, then a recovered tender
 with a deadline extension and corrigendum. It prints snapshot versions, change
 kinds, quarantine count, recovery evidence count, and final source state.
 
-## Run the local source
+## Run the complete local demo
 
 ```bash
 pnpm dev:chaos-source
-```
-
-Use the query modes listed in the root README. The server watch process restarts
-when its TypeScript source changes.
-
-## Run the web shell
-
-```bash
+pnpm start:api
 pnpm dev:web
 ```
 
-Open `http://127.0.0.1:4173`. The web app currently renders typed fixture data;
-it does not fetch the chaos source.
+Run each command in its own terminal, then open `http://127.0.0.1:4173`. With no
+Bright Data credentials, the API and dashboard clearly identify themselves as
+mock mode. Use the six numbered actions in order.
+
+The chaos source is at `http://127.0.0.1:4311`. Its stable public target is
+`/tenders`; use `/__control` to switch among `baseline-table`, `layout-cards`,
+`amended`, and `unavailable`.
+
+## Run live collection
+
+```bash
+cp .env.example .env
+# Fill the three BRIGHT_DATA_* values and BIDSENTINEL_SOURCE_ID privately.
+pnpm collect
+```
+
+The API enters live mode only when the token, collector ID, and target URL are
+all present in its process environment. Live API mutations also require
+`BIDSENTINEL_ENABLE_LIVE_MUTATIONS=true`, a private 32+ character operator
+token, and the matching header on every mutating request. Keep the flag false
+for read-only inspection.
 
 ## Full verification
 

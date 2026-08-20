@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import { MockBrightDataHealingProvider } from "@bidsentinel/brightdata";
 
 import {
   tenderWithCorrigendumFixture,
@@ -6,6 +8,7 @@ import {
 } from "@bidsentinel/contracts/fixtures";
 
 import { BidSentinelPipeline } from "./pipeline.js";
+import { SelfHealingCoordinator } from "./healing-coordinator.js";
 
 const context = {
   sourceId: "gem",
@@ -155,5 +158,95 @@ describe("BidSentinelPipeline", () => {
     if (result.outcome === "quarantined") {
       expect(result.health.activeIncident?.reason).toBe("schema-drift");
     }
+  });
+
+  it("quarantines one malformed row in a 100-row batch without healing", async () => {
+    const provider = new MockBrightDataHealingProvider();
+    const trigger = vi.spyOn(provider, "triggerRefactor");
+    const pipeline = new BidSentinelPipeline();
+    pipeline.healingCoordinator = new SelfHealingCoordinator(provider);
+    const validRows = Array.from({ length: 99 }, (_, index) => ({
+      ...validTenderFixture,
+      tenderId: `gem:valid-${index}`,
+      externalId: `valid-${index}`,
+      url: `https://example.gov.test/tenders/valid-${index}`,
+    }));
+
+    const results = await pipeline.processBatchWithHealing(
+      [...validRows, { tenderId: "gem:broken", externalId: "broken" }],
+      { ...context, collectorId: "c_batch_safe" },
+    );
+
+    expect(
+      results.filter((result) => result.outcome === "accepted"),
+    ).toHaveLength(99);
+    expect(
+      results.filter((result) => result.outcome === "quarantined"),
+    ).toHaveLength(1);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
+  it("does not heal a first-ever empty batch without a verified baseline", async () => {
+    const provider = new MockBrightDataHealingProvider();
+    const trigger = vi.spyOn(provider, "triggerRefactor");
+    const pipeline = new BidSentinelPipeline();
+    pipeline.healingCoordinator = new SelfHealingCoordinator(provider);
+
+    const results = await pipeline.processBatchWithHealing([], {
+      ...context,
+      collectorId: "c_initial_empty",
+    });
+
+    expect(results).toEqual([]);
+    expect(pipeline.quarantines.listBySource("gem")).toEqual([]);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
+  it("heals a count collapse only after a verified batch baseline", async () => {
+    const provider = new MockBrightDataHealingProvider();
+    const trigger = vi.spyOn(provider, "triggerRefactor");
+    const pipeline = new BidSentinelPipeline();
+    pipeline.healingCoordinator = new SelfHealingCoordinator(provider);
+    const baseline = Array.from({ length: 4 }, (_, index) => ({
+      ...validTenderFixture,
+      tenderId: `gem:baseline-${index}`,
+      externalId: `baseline-${index}`,
+      url: `https://example.gov.test/tenders/baseline-${index}`,
+    }));
+    const batchContext = { ...context, collectorId: "c_collapse" };
+
+    await pipeline.processBatchWithHealing(baseline, batchContext);
+    expect(trigger).not.toHaveBeenCalled();
+    const collapsed = await pipeline.processBatchWithHealing([], batchContext);
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]?.outcome).toBe("quarantined");
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledWith(
+      "c_collapse",
+      expect.stringContaining("result-count collapse"),
+    );
+  });
+
+  it("heals the same majority structural signature repeated across two runs", async () => {
+    const provider = new MockBrightDataHealingProvider();
+    const trigger = vi.spyOn(provider, "triggerRefactor");
+    const pipeline = new BidSentinelPipeline();
+    pipeline.healingCoordinator = new SelfHealingCoordinator(provider);
+    const broken = [
+      { tenderId: "gem:broken-1", externalId: "broken-1" },
+      { tenderId: "gem:broken-2", externalId: "broken-2" },
+    ];
+    const batchContext = { ...context, collectorId: "c_repeat" };
+
+    await pipeline.processBatchWithHealing(broken, batchContext);
+    expect(trigger).not.toHaveBeenCalled();
+    await pipeline.processBatchWithHealing(broken, batchContext);
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledWith(
+      "c_repeat",
+      expect.stringContaining("Confirmed batch-level layout drift"),
+    );
   });
 });

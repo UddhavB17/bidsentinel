@@ -4,7 +4,8 @@
 
 ```mermaid
 flowchart LR
-  Source[Public source / chaos fixture] --> Extract[Extracted payload]
+  Source[Public source / chaos HTML] --> BrightData[Bright Data collector c_*]
+  BrightData --> Extract[Extracted payload batch]
   Extract --> Validate{TenderSchema}
   Validate -->|invalid| Quarantine[Quarantine record]
   Validate -->|valid| Fingerprint[Stable state fingerprint]
@@ -16,6 +17,13 @@ flowchart LR
   Quarantine -->|later valid poll| Recovery[Recovery evidence]
   Recovery --> Health[Source health]
   Validate --> Health
+  Quarantine --> DriftGate{Confirmed structural drift?}
+  DriftGate -->|no| Retain
+  DriftGate -->|yes| Heal[Refactor same collector]
+  Heal --> Preview[Schema and count preview gate]
+  Preview --> Approval[Human approval]
+  Approval --> Rerun[Rerun same collector]
+  Rerun --> Recovery
 ```
 
 ## Boundaries
@@ -45,10 +53,9 @@ payload's `sourceId` matches the collection context.
 
 ### Collector worker
 
-`services/collector-worker` is a synchronous reference pipeline with replaceable
-in-memory stores. It does not poll, schedule, or make HTTP requests. That keeps
-the first implementation deterministic and makes persistence/queue adapters a
-later boundary decision.
+`services/collector-worker` contains the in-memory pipeline, an HTTP API, a
+one-cycle collection command, explicit mock/live runtime selection, and the
+self-healing coordinator. Persistence and scheduling remain replaceable seams.
 
 Snapshots represent material state, not every observation. The fingerprint
 therefore excludes `observedAt`; a duplicate poll updates source health without
@@ -62,24 +69,28 @@ Invalid input returns the previous verified snapshot unchanged. See
 
 ### Provider package
 
-`packages/brightdata` defines a provider-neutral collection interface and a
-fail-closed placeholder. It contains no SDK, credentials, or outbound network
-code.
+`packages/brightdata` implements bounded Scraper Studio HTTP adapters. Collection
+triggers `/dca/trigger` with `queue_next=1`, then polls the returned collection
+job. Healing requests a refactor for the same `c_*` collector, preserves the
+structured preview, resumes only after approval, and polls terminal status.
+Errors are typed and sanitized; tokens remain in authorization headers.
 
 ### Local applications
 
-`apps/chaos-source` supplies deterministic valid and invalid payloads over local
-HTTP. `apps/web` is a compiled dashboard shell proving that browser code can
-consume the same typed contracts.
+`apps/chaos-source` supplies a stable HTML target whose table layout can become
+cards without changing business data, then publish a real amendment. `apps/web`
+consumes the typed API and presents the complete judge-visible recovery flow.
 
 ## Explicit MVP limits
 
 - State is in memory and resets when the process exits.
-- The chaos source and collector demo are intentionally not connected.
-- There is no scheduler, durable database, queue, auth, notification delivery,
-  or external collection integration.
-- Recovery evidence currently covers the deterministic "next poll becomes
-  valid" path. Retry/backoff and alternate-parser strategies are modeled in the
-  contract but are not executed.
+- There is no scheduler, durable database, queue, user-account auth, or
+  notification delivery.
+- The chaos control route and `/api/dev/*` mutations are demo/operator surfaces,
+  not a public production control plane. Live mutations have an explicit flag
+  and operator-token gate; the chaos control route must remain local/private.
+- Automated tests use deterministic providers. A credentialed live Bright Data
+  run and saved external evidence are required before claiming the integration
+  has been demonstrated against a real account.
 
 These are intentional seams, not hidden production claims.
