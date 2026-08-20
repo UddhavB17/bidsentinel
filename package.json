@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm demo:collector",
     "dev:web": "pnpm --filter @bidsentinel/web dev",
     "dev:chaos-source": "pnpm --filter @bidsentinel/chaos-source dev",
     "demo:collector": "pnpm --filter @bidsentinel/collector-worker demo",

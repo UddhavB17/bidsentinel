@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "tsup src/server.ts --format esm --clean",
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
+    "dev": "node --watch --import tsx src/server.ts",
+    "start": "node --import tsx src/server.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json"
   },

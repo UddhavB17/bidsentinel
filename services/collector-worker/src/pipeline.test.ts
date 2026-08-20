@@ -86,4 +86,74 @@ describe("BidSentinelPipeline", () => {
     }
     expect(pipeline.recoveryEvidence.listBySource("gem")).toHaveLength(1);
   });
+
+  it("rejects semantically invalid snapshots without replacing the baseline", () => {
+    const pipeline = new BidSentinelPipeline();
+    pipeline.process(validTenderFixture, context);
+    const originalDocument = validTenderFixture.documents[0];
+    if (originalDocument === undefined) {
+      throw new Error("Fixture must include a document");
+    }
+
+    const duplicate = pipeline.process(
+      {
+        ...validTenderFixture,
+        observedAt: "2026-08-21T05:00:00.000Z",
+        documents: [originalDocument, { ...originalDocument }],
+      },
+      { ...context, observedAt: "2026-08-21T05:00:00.000Z" },
+    );
+    const regressed = pipeline.process(
+      {
+        ...validTenderFixture,
+        status: "closed",
+        observedAt: "2026-08-19T05:00:00.000Z",
+      },
+      { ...context, observedAt: "2026-08-19T05:00:00.000Z" },
+    );
+
+    expect(duplicate.outcome).toBe("quarantined");
+    expect(regressed.outcome).toBe("quarantined");
+    expect(pipeline.snapshots.list(validTenderFixture.tenderId)).toHaveLength(
+      1,
+    );
+    expect(
+      pipeline.snapshots.latest(validTenderFixture.tenderId)?.tender.status,
+    ).toBe("open");
+  });
+
+  it("keeps stored snapshots isolated from returned mutable objects", () => {
+    const pipeline = new BidSentinelPipeline();
+    const accepted = pipeline.process(validTenderFixture, context);
+    if (accepted.outcome !== "accepted" || accepted.snapshot === null) {
+      throw new Error("Fixture must produce a snapshot");
+    }
+
+    accepted.snapshot.tender.status = "closed";
+    accepted.health.state = "quarantined";
+    const readCopy = pipeline.snapshots.latest(validTenderFixture.tenderId);
+    if (readCopy === null) {
+      throw new Error("Expected stored snapshot");
+    }
+    readCopy.tender.status = "cancelled";
+
+    expect(
+      pipeline.snapshots.latest(validTenderFixture.tenderId)?.tender.status,
+    ).toBe("open");
+    expect(pipeline.sourceHealth.get("gem")?.state).toBe("healthy");
+  });
+
+  it("classifies structural extraction failure as schema drift", () => {
+    const pipeline = new BidSentinelPipeline();
+    const invalidShape: Record<string, unknown> =
+      structuredClone(validTenderFixture);
+    Reflect.deleteProperty(invalidShape, "title");
+
+    const result = pipeline.process(invalidShape, context);
+
+    expect(result.outcome).toBe("quarantined");
+    if (result.outcome === "quarantined") {
+      expect(result.health.activeIncident?.reason).toBe("schema-drift");
+    }
+  });
 });

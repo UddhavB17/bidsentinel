@@ -11,15 +11,19 @@ export class InMemorySnapshotStore {
 
   append(snapshot: TenderSnapshot): void {
     const existing = this.#items.get(snapshot.tenderId) ?? [];
-    this.#items.set(snapshot.tenderId, [...existing, snapshot]);
+    this.#items.set(snapshot.tenderId, [
+      ...existing,
+      structuredClone(snapshot),
+    ]);
   }
 
   latest(tenderId: string): TenderSnapshot | null {
-    return this.#items.get(tenderId)?.at(-1) ?? null;
+    const snapshot = this.#items.get(tenderId)?.at(-1);
+    return snapshot === undefined ? null : structuredClone(snapshot);
   }
 
   list(tenderId: string): TenderSnapshot[] {
-    return [...(this.#items.get(tenderId) ?? [])];
+    return structuredClone(this.#items.get(tenderId) ?? []);
   }
 }
 
@@ -39,11 +43,11 @@ export class InMemoryChangeEventStore {
   readonly #items: TenderChangeEvent[] = [];
 
   append(event: TenderChangeEvent): void {
-    this.#items.push(event);
+    this.#items.push(structuredClone(event));
   }
 
   list(): TenderChangeEvent[] {
-    return [...this.#items];
+    return structuredClone(this.#items);
   }
 }
 
@@ -51,11 +55,13 @@ export class InMemoryRecoveryEvidenceStore {
   readonly #items: RecoveryEvidence[] = [];
 
   append(evidence: RecoveryEvidence): void {
-    this.#items.push(evidence);
+    this.#items.push(structuredClone(evidence));
   }
 
   listBySource(sourceId: string): RecoveryEvidence[] {
-    return this.#items.filter((item) => item.sourceId === sourceId);
+    return structuredClone(
+      this.#items.filter((item) => item.sourceId === sourceId),
+    );
   }
 }
 
@@ -63,10 +69,11 @@ export class InMemorySourceHealthStore {
   readonly #items = new Map<string, SourceHealth>();
 
   set(health: SourceHealth): void {
-    this.#items.set(health.sourceId, health);
+    this.#items.set(health.sourceId, structuredClone(health));
   }
 
   get(sourceId: string): SourceHealth | null {
-    return this.#items.get(sourceId) ?? null;
+    const health = this.#items.get(sourceId);
+    return health === undefined ? null : structuredClone(health);
   }
 }

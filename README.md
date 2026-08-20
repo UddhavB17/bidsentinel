@@ -21,8 +21,8 @@ pnpm install
 pnpm check
 ```
 
-`pnpm check` runs lint, type checking, unit tests, and production builds for the
-whole workspace.
+`pnpm check` runs lint, type checking, unit tests, production builds, and the
+collector demo for the whole workspace.
 
 ## Workspace map
 
