@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - services/*
+  - packages/*
+
+catalog:
+  zod: ^3.25.76
+
+allowBuilds:
+  esbuild: true

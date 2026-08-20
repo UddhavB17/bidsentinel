@@ -1,0 +1,19 @@
+{
+  "name": "@bidsentinel/collector-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts --format esm --dts --clean",
+    "demo": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@bidsentinel/contracts": "workspace:*",
+    "@bidsentinel/validation": "workspace:*"
+  }
+}
