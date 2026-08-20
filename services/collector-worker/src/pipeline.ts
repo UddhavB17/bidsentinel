@@ -19,6 +19,7 @@ import {
 } from "@bidsentinel/validation";
 
 import { detectTenderChanges } from "./change-detection.js";
+import type { SelfHealingCoordinator } from "./healing-coordinator.js";
 import { diffTenderSnapshots } from "./semantic-diff.js";
 import {
   InMemoryChangeEventStore,
@@ -60,6 +61,17 @@ function incidentReasonFor(
   return hasStructuralFailure ? "schema-drift" : "invalid-extraction";
 }
 
+function isLayoutDrift(quarantine: QuarantinedExtraction): boolean {
+  return quarantine.issues.some(
+    (issue) =>
+      issue.code === "unrecognized_keys" ||
+      (issue.code === "invalid_type" && issue.message === "Required") ||
+      issue.code === "record_count_collapse" ||
+      issue.code === "invalid_string" ||
+      issue.code === "invalid_type"
+  );
+}
+
 export class BidSentinelPipeline {
   readonly snapshots = new InMemorySnapshotStore();
   readonly quarantines = new InMemoryQuarantineStore();
@@ -67,16 +79,26 @@ export class BidSentinelPipeline {
   readonly recoveryEvidence = new InMemoryRecoveryEvidenceStore();
   readonly sourceHealth = new InMemorySourceHealthStore();
   readonly #attempts = new Map<string, boolean[]>();
+  healingCoordinator: SelfHealingCoordinator | null = null;
 
   process(input: unknown, context: ExtractionContext): ProcessingResult {
     const validation = validateTenderExtraction(input, context);
 
     if (!validation.ok) {
-      return this.quarantine(
+      const outcome = this.quarantine(
         validation.quarantine,
         context,
         incidentReasonFor(validation.quarantine),
       );
+
+      if (this.healingCoordinator && isLayoutDrift(validation.quarantine)) {
+        const prompt = `Layout drift detected: validation issues: ${validation.quarantine.issues.map((i) => i.message).join("; ")}`;
+        this.healingCoordinator
+          .handleDrift(context.sourceId, context.extractorVersion, "schema-drift", prompt, context.observedAt)
+          .catch(() => {});
+      }
+
+      return outcome;
     }
 
     const tender = validation.value;
@@ -125,7 +147,16 @@ export class BidSentinelPipeline {
         rawPayload: input,
         issues: rejection.issues,
       });
-      return this.quarantine(quarantine, context, "invalid-extraction");
+      const outcome = this.quarantine(quarantine, context, "invalid-extraction");
+
+      if (this.healingCoordinator && isLayoutDrift(quarantine)) {
+        const prompt = `Layout drift detected: record count collapse or validation issues: ${quarantine.issues.map((i) => i.message).join("; ")}`;
+        this.healingCoordinator
+          .handleDrift(context.sourceId, context.extractorVersion, "schema-drift", prompt, context.observedAt)
+          .catch(() => {});
+      }
+
+      return outcome;
     }
 
     const snapshot =

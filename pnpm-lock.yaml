@@ -80,12 +80,18 @@ importers:
 
   services/collector-worker:
     dependencies:
+      '@bidsentinel/brightdata':
+        specifier: workspace:*
+        version: link:../../packages/brightdata
       '@bidsentinel/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
       '@bidsentinel/validation':
         specifier: workspace:*
         version: link:../../packages/validation
+      zod:
+        specifier: 'catalog:'
+        version: 3.25.76
 
 packages:
 

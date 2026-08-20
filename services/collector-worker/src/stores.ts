@@ -25,6 +25,10 @@ export class InMemorySnapshotStore {
   list(tenderId: string): TenderSnapshot[] {
     return structuredClone(this.#items.get(tenderId) ?? []);
   }
+
+  listUniqueTenderIds(): string[] {
+    return Array.from(this.#items.keys());
+  }
 }
 
 export class InMemoryQuarantineStore {
@@ -36,6 +40,10 @@ export class InMemoryQuarantineStore {
 
   listBySource(sourceId: string): QuarantinedExtraction[] {
     return this.#items.filter((item) => item.sourceId === sourceId);
+  }
+
+  list(): QuarantinedExtraction[] {
+    return structuredClone(this.#items);
   }
 }
 
@@ -75,5 +83,9 @@ export class InMemorySourceHealthStore {
   get(sourceId: string): SourceHealth | null {
     const health = this.#items.get(sourceId);
     return health === undefined ? null : structuredClone(health);
+  }
+
+  listSourceIds(): string[] {
+    return Array.from(this.#items.keys());
   }
 }
